@@ -1,0 +1,94 @@
+name: relay
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'send|read'
+        required: true
+        default: 'read'
+      target:
+        description: 'bot username or chat id'
+        required: true
+      text:
+        description: 'message text'
+        required: false
+        default: ''
+      wait:
+        description: 'seconds to wait for reply'
+        required: false
+        default: '60'
+      limit:
+        description: 'messages to read back'
+        required: false
+        default: '3'
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install telethon -q
+      - run: |
+          cat > relay.py << 'PYEOF'
+          import asyncio, base64, hashlib, json, os, urllib.request
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+          KEY = bytes.fromhex(os.environ["OUT_KEY"])
+          def xor(data):
+              out = bytearray(); ctr = 0
+              while len(out) < len(data):
+                  out += hashlib.sha256(KEY + ctr.to_bytes(8, "big")).digest(); ctr += 1
+              return bytes(a ^ b for a, b in zip(data, out))
+
+          async def main():
+              act, tgt = os.environ["IN_ACTION"], os.environ["IN_TARGET"]
+              out = {"action": act, "target": tgt}
+              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.connect()
+              ent = await client.get_entity(tgt)
+              if act == "send":
+                  await client.send_message(ent, os.environ["IN_TEXT"])
+                  await asyncio.sleep(int(os.environ.get("IN_WAIT", "60")))
+              msgs = await client.get_messages(ent, limit=int(os.environ.get("IN_LIMIT", "3")))
+              out["messages"] = [{"sender": m.sender_id, "text": (m.message or "")[:1500], "date": str(m.date)} for m in reversed(msgs)]
+              await client.disconnect()
+              enc = base64.b64encode(xor(json.dumps(out, ensure_ascii=False).encode())).decode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GH_REPO']}/contents/out.enc",
+                  data=json.dumps({"message": "relay out", "content": base64.b64encode(enc.encode()).decode(),
+                                    "sha": None}).encode(),
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN_W"], "Accept": "application/vnd.github+json"},
+                  method="PUT")
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  # update: get sha and retry
+                  sha = json.loads(urllib.request.urlopen(urllib.request.Request(
+                      f"https://api.github.com/repos/{os.environ['GH_REPO']}/contents/out.enc",
+                      headers={"Authorization": "Bearer " + os.environ["GH_TOKEN_W"]})).read())["sha"]
+                  req2 = urllib.request.Request(
+                      f"https://api.github.com/repos/{os.environ['GH_REPO']}/contents/out.enc",
+                      data=json.dumps({"message": "relay out", "content": base64.b64encode(enc.encode()).decode(), "sha": sha}).encode(),
+                      headers={"Authorization": "Bearer " + os.environ["GH_TOKEN_W"], "Accept": "application/vnd.github+json"},
+                      method="PUT")
+                  urllib.request.urlopen(req2)
+              print("RELAY_DONE")
+
+          asyncio.run(main())
+          PYEOF
+          python relay.py
+        env:
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          GH_TOKEN_W: ${{ secrets.GH_TOKEN_W }}
+          OUT_KEY: ${{ secrets.OUT_KEY }}
+          GH_REPO: mexc1433-crypto/net-relay
+          IN_ACTION: ${{ github.event.inputs.action }}
+          IN_TARGET: ${{ github.event.inputs.target }}
+          IN_TEXT: ${{ github.event.inputs.text }}
+          IN_WAIT: ${{ github.event.inputs.wait }}
+          IN_LIMIT: ${{ github.event.inputs.limit }}
